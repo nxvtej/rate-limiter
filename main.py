@@ -56,15 +56,38 @@ async def shutdown():
     if redis_client:
         await redis_client.close()
         logger.info("Redis connection closed")
-        
-async def is_rate_limited(client_ip: str)->bool:
+
+async def is_rate_limited(client_ip: str, request: Request) -> bool:
     """
-    Check if the client IP is rate limited based on the configured limits.
+    Implements distributed fixed-window rate limiting using Redis.
+    Returns True if the client is rate-limited, False otherwise.
     """
+    
     global total_requests_processed, total_requests_blocked
     total_requests_processed += 1
 
-    logger.info(f"Processing request from {client_ip}. (Rate limiting logic is pending full implementation in Phase 2.)")
+    logger.info(f"Processing request from {client_ip}. Total requests processed: {total_requests_processed}")
+    key = f"rate_limit:{client_ip}"
+    
+    pipe = redis_client.pipeline()
+    try:
+        pipe.incr(key, 1)
+        pipe.expire(key, TIME_WINDOW)
+        current_count, _ = await pipe.execute()
+    except Exception as e:
+        logger.error(f"Error occurred while checking rate limit for {client_ip}: {e}")
+        total_requests_blocked += 1
+        raise HTTPException(
+            status_code=500,
+            detail="Internal Server Error while checking rate limit"
+        )
+
+    if current_count > RATE_LIMITS[request.method]:
+        total_requests_blocked += 1
+        logger.warning(f"Rate limit exceeded for {client_ip}. Total requests blocked: {total_requests_blocked}")
+        return True
+
+    logger.debug(f"Rate limit check passed for {client_ip}. Current count: {current_count} within limit: {RATE_LIMITS[request.method]}")
     return False
 
 
@@ -72,7 +95,7 @@ async def is_rate_limited(client_ip: str)->bool:
 async def catch_all_proxy(request: Request, path: str) -> Response:
     client_ip = request.client.host
 
-    if await is_rate_limited(client_ip):
+    if await is_rate_limited(client_ip, request):
         raise HTTPException(
             status_code=429,
             detail=f"Too Many Requests. Limit: {RATE_LIMITS[request.method]} per {TIME_WINDOW}s. Please retry after {TIME_WINDOW} seconds."
